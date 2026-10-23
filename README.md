@@ -12,15 +12,14 @@ A minimal practice tool for **SNAPTIC 0.91.0.0** (Godot 4.7.1, Windows x64).
 | Always-on HUD with tick/hitch/FPS info (F12) | ✅ |
 
 
-## Non-Features
+## TO DO
 
-- No record / replay
-- No snapshots / rewind
-- No run-file save/load
-- No true reverse execution
-- No online run IDs
-- No particle / tween / audio / Jolt snapshotting
-- No game content in this repository
+-  record / replay
+-  snapshots / rewind
+-  run-file save/load
+-  true reverse execution
+-  online run IDs
+-  particle / tween / audio / Jolt snapshotting
 
 ## Requirements
 
