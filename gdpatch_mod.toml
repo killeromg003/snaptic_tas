@@ -1,0 +1,8 @@
+id = "snaptic_tas"
+
+[meta]
+name = "SNAPTIC-TAS"
+version = "0.1.0"
+authors = ["killeromg003"]
+description = "TAS tool"
+
