@@ -5,9 +5,11 @@ extends Node
 ## Uses Engine.time_scale for pause/step/slow-mo so player physics always run.
 
 const HudScript = preload("res://gdpatch/mods/snaptic_tas/tas_hud.gd")
+const SnapshotCodec = preload("res://gdpatch/mods/snaptic_tas/tas_snapshot.gd")
 
 const VERSION: String = "0.2.0"
 const TICK_RATE: int = 60
+const SNAPSHOT_SLOTS: int = 10
 const SLOWMO_STEPS: Array[float] = [1.0, 0.5, 0.25]
 const LEVELS: Dictionary = {
 	"test_room": 1,
@@ -26,6 +28,13 @@ var _hitstop_original_node: Node = null
 var _hitstop_neutralized: bool = false
 
 var _hud: CanvasLayer = null
+
+var _snapshot = null
+var _snapshot_slots: Array = []
+var _slot: int = 0
+var _pending_snapshot_slot: int = -1
+var _pending_load_slot: int = -1
+var _pending_pause: bool = false
 
 var _perf_enabled: bool = false
 var _old_max_fps: int = 0
@@ -54,6 +63,9 @@ func _ready() -> void:
 	process_mode = Node.PROCESS_MODE_ALWAYS
 	process_priority = -1000
 	add_to_group(&"tas_runtime")
+
+	_snapshot = SnapshotCodec.new()
+	_snapshot_slots.resize(SNAPSHOT_SLOTS)
 
 	_hud = HudScript.new()
 	add_child(_hud)
@@ -93,6 +105,14 @@ func _process(_delta: float) -> void:
 		_pending_f12_hud = false
 		_hud.call(&"toggle_visible")
 
+	if _pending_pause and not _stepping:
+		_pending_pause = false
+		_was_paused_by_tas = true
+		_sync_time_scale()
+
+	if _was_paused_by_tas and not _stepping:
+		_apply_paused_freelook()
+
 	## Use wall-clock time so the HUD keeps refreshing while time_scale is 0.
 	var now := Time.get_ticks_msec()
 	if now - _hud_last_refresh >= 100:
@@ -100,8 +120,14 @@ func _process(_delta: float) -> void:
 		_refresh_hud()
 
 func _physics_process(_delta: float) -> void:
-	if _player == null or not is_instance_valid(_player):
-		return
+	if _pending_snapshot_slot >= 0:
+		var slot := _pending_snapshot_slot
+		_pending_snapshot_slot = -1
+		_capture_slot(slot)
+	if _pending_load_slot >= 0:
+		var slot := _pending_load_slot
+		_pending_load_slot = -1
+		_apply_snapshot_slot(slot)
 
 
 func _sync_time_scale() -> void:
@@ -149,6 +175,120 @@ func _cycle_slowmo() -> void:
 		_status("slow-mo %.2fx" % SLOWMO_STEPS[_slowmo_index])
 
 
+func _save_snapshot(cycle: bool) -> void:
+	if cycle:
+		_slot = (_slot + 1) % SNAPSHOT_SLOTS
+		_status("snapshot slot %d (%s)" % [_slot, _slot_summary(_slot)])
+		return
+	if get_tree().paused or _was_paused_by_tas:
+		_capture_slot(_slot)
+	else:
+		_pending_snapshot_slot = _slot
+		_status("snapshot armed for slot %d" % _slot)
+
+
+func _capture_slot(slot: int) -> void:
+	if _player == null or not is_instance_valid(_player):
+		_status("cannot snapshot: no player", true)
+		return
+	if _snapshot == null:
+		_status("cannot snapshot: codec unavailable", true)
+		return
+	var can: Dictionary = _snapshot.can_capture(_player)
+	if not bool(can.get("ok", false)):
+		_status("cannot snapshot: " + str(can.get("reason", "unknown state")), true)
+		return
+	var tick := Engine.get_physics_frames()
+	_snapshot_slots[slot] = {
+		"snapshot": _snapshot.capture(_player, tick),
+		"tick": tick,
+	}
+	_status("saved snapshot %d at tick %d" % [slot, tick])
+	_log("snapshot slot %d saved at tick %d" % [slot, tick])
+
+
+func _load_snapshot(cycle: bool) -> void:
+	if cycle:
+		_slot = (_slot - 1 + SNAPSHOT_SLOTS) % SNAPSHOT_SLOTS
+		_status("snapshot slot %d (%s)" % [_slot, _slot_summary(_slot)])
+		return
+	if _snapshot_slots[_slot] == null:
+		_status("snapshot slot %d is empty" % _slot, true)
+		return
+	if get_tree().paused or _was_paused_by_tas:
+		_apply_snapshot_slot(_slot)
+	else:
+		_pending_load_slot = _slot
+		_status("snapshot load armed for slot %d" % _slot)
+
+
+func _apply_snapshot_slot(slot: int) -> void:
+	var entry = _snapshot_slots[slot]
+	if entry == null:
+		_status("snapshot slot %d is empty" % slot, true)
+		return
+	if _player == null or not is_instance_valid(_player):
+		_status("cannot load snapshot: no player", true)
+		return
+	var snapshot: Dictionary = entry["snapshot"]
+	var restored: Dictionary = _snapshot.restore(_player, snapshot)
+	if not bool(restored.get("ok", false)):
+		_status("snapshot load failed: " + str(restored.get("reason", "unknown")), true)
+		return
+	_snap_view()
+	_was_paused_by_tas = true
+	_sync_time_scale()
+	_pending_pause = true
+	var tick := int(entry.get("tick", 0))
+	_status("loaded snapshot %d at tick %d" % [slot, tick])
+	_log("snapshot slot %d loaded at tick %d" % [slot, tick])
+
+
+func _snap_view() -> void:
+	## The snapshot restores the player bodies and the camera holder transform, but
+	## the camera spring arm keeps its own lag point (ShapeCast3D). The camera manager
+	## recomputes the holder from that lag point every physics tick, even when
+	## Engine.time_scale is 0, which would drag the camera back to its pre-load spot.
+	## Push the restored transforms through the followers and snap the active camera
+	## controllers so the player and camera are correct before the next unpause.
+	if _player == null or not is_instance_valid(_player):
+		return
+	if _player.has_method(&"snap_followers"):
+		_player.call(&"snap_followers")
+	_snap_camera()
+
+
+func _apply_paused_freelook() -> void:
+	## While TAS-paused the camera controllers still consume look input: LookInput
+	## builds a look vector every physics tick and the rotation controller rotates
+	## its target basis, but delta-based damping cannot move the holder at delta 0.
+	## Snap the holder to the rotated target so the mouse looks around immediately
+	## instead of the view only catching up on unpause.
+	if _player == null or not is_instance_valid(_player):
+		return
+	_snap_camera()
+
+
+func _snap_camera() -> void:
+	if _camera_manager == null:
+		return
+	var rotation_controller = _camera_manager.get("rotation_controller")
+	if rotation_controller != null and rotation_controller.has_method(&"snap_to_target_rotation"):
+		rotation_controller.call(&"snap_to_target_rotation")
+	var position_controller = _camera_manager.get("position_controller")
+	if position_controller != null and position_controller.has_method(&"snap_to_target_position"):
+		position_controller.call(&"snap_to_target_position")
+	if _camera_holder != null:
+		_camera_holder.force_update_transform()
+
+
+func _slot_summary(slot: int) -> String:
+	var entry = _snapshot_slots[slot]
+	if entry == null:
+		return "empty"
+	return "tick %d" % int(entry.get("tick", 0))
+
+
 func _bind_player_if_needed() -> void:
 	var current: Node = get_tree().get_first_node_in_group(&"player")
 	if current == _player:
@@ -172,6 +312,8 @@ func _on_player_bound() -> void:
 	_hitstop = _player.get("hitstop_component")
 	_hitstop_original_node = null
 	_hitstop_neutralized = false
+	if _snapshot != null:
+		_snapshot.bind(_player)
 	_enable_perf()
 	_enable_camera_order()
 	_neutralize_hitstop()
@@ -181,6 +323,8 @@ func _on_player_bound() -> void:
 
 
 func _on_player_lost() -> void:
+	if _snapshot != null:
+		_snapshot.unbind()
 	_restore_look_physics()
 	_restore_hitstop()
 	_restore_camera_order()
@@ -299,6 +443,10 @@ func _input(event: InputEvent) -> void:
 				_pending_f6_toggle = true
 		KEY_F7:
 			_pending_f7_step = true
+		KEY_F8:
+			_save_snapshot(key_event.shift_pressed)
+		KEY_F9:
+			_load_snapshot(key_event.shift_pressed)
 		KEY_F12:
 			_pending_f12_hud = true
 		_:
@@ -313,6 +461,8 @@ func _exit_tree() -> void:
 	_restore_hitstop()
 	_restore_camera_order()
 	_restore_perf()
+	if _snapshot != null:
+		_snapshot.unbind()
 	Engine.time_scale = 1.0
 	remove_from_group(&"tas_runtime")
 
@@ -397,8 +547,10 @@ func _refresh_hud() -> void:
 			Engine.get_frames_per_second(),
 			Engine.physics_ticks_per_second,
 		])
+		lines.append("snapshot slot %d   %s" % [_slot, _slot_summary(_slot)])
 
 	lines.append("[color=#9fb4c8]F6 pause   F7 step   Shift+F6 slow-mo   F12 HUD[/color]")
+	lines.append("[color=#9fb4c8]F8 save snapshot   F9 load snapshot   Shift+F8/F9 slot[/color]")
 
 	if Time.get_ticks_msec() <= _status_until and _status_message != "":
 		var color := "#ff7070" if _status_error else "#9fe8a0"

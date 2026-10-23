@@ -8,7 +8,7 @@ extends Node
 ## mismatch it shows an error HUD and leaves the game running unmodified (the
 ## Lua patches are anchored and fail closed, but they may still be present).
 
-const TOOL_VERSION: String = "0.1.0"
+const TOOL_VERSION: String = "0.2.0"
 const REQUIRED_ENGINE: String = "4.7.1"
 const REQUIRED_GAME: String = "0.91"
 const REQUIRED_TICK_RATE: int = 60
