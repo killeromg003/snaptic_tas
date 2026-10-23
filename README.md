@@ -10,7 +10,7 @@ A minimal practice tool for **SNAPTIC 0.91.0.0** (Godot 4.7.1, Windows x64).
 | Frame-step (F7) | ✅ |
 | Slow-motion 1× / 0.5× / 0.25× (Shift+F6) | ✅ |
 | Always-on HUD with tick/hitch/FPS info (F12) | ✅ |
-| Auto-load test level (`--tas-level=gym`) | ✅ |
+
 
 ## Non-Features
 
