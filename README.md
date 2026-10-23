@@ -27,8 +27,6 @@ A minimal practice tool for **SNAPTIC 0.91.0.0** (Godot 4.7.1, Windows x64).
 - **SNAPTIC 0.91.0.0** (Windows x64)
 - **Godot 4.7.1** (engine version `4.7.1.stable.custom_build`)
 - **GDPatch 0.2.4** (included as `winmm.dll`)
-- PCK encryption key: `eb74e928c34749204a5bae90975743d700c5a38827c0f51bdde11a8747a9e6e0`
-
 The tool **refuses to run** on version mismatch and **asserts expected script paths exist** — no silent patching.
 
 ## Installation
@@ -45,8 +43,6 @@ The tool **refuses to run** on version mismatch and **asserts expected script pa
 
 ## Uninstallation
 
-- Delete `GDPatch/mods/snaptic_tas/`
-- Delete `GDPatch/config.toml` (or remove the `[engine]` section)
 - Delete `winmm.dll`
 - No files outside `GDPatch/` are modified
 
@@ -59,24 +55,11 @@ The tool **refuses to run** on version mismatch and **asserts expected script pa
 | **F7** | Single frame step (while paused) |
 | **F12** | Toggle HUD visibility |
 
-## Debug Launch Options
-
-```bash
-snaptic.exe --tas-level=gym          # Auto-load Gym level on start
-snaptic.exe --tas-level=test_room    # Auto-load Test Room
-```
-
-Or set in `GDPatch/config.toml`:
-```toml
-[config.snaptic_tas.debug]
-autoload_level = "gym"
-```
 
 ## Known Issues
 
 - **Hitstop** — neutralized during TAS by clearing `HitstopComponent.node_to_pause`; may affect feel.
 - **Render-rate non-determinism** — mitigated by `max_fps=240`, vsync off, and hitch detection (flags frames with >1 physics tick).
-- **Dev terminal (Ctrl+Alt+D)** — F3 focuses terminal; no conflict since TAS doesn't use F3.
 - **Jolt Physics determinism** — not compiled with `JPH_ENABLE_DETERMINISM`; physics may drift across sessions.
 
 ## Version Matrix
