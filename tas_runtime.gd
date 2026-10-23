@@ -37,6 +37,20 @@ var _last_hitch_tick: int = -1
 var _slowmo_index: int = 0
 var _was_paused_by_tas: bool = false
 var _stepping: bool = false
+
+var _status_message: String = ""
+var _status_error: bool = false
+var _status_until: int = 0
+var _hud_last_refresh: int = 0
+var _booted: bool = false
+var _debug_level: String = ""
+
+var _camera_order_enabled: bool = false
+var _old_camera_priority: int = 0
+var _look_physics_was_enabled: bool = true
+
+
+func _ready() -> void:
 	process_mode = Node.PROCESS_MODE_ALWAYS
 	process_priority = -1000
 	add_to_group(&"tas_runtime")
@@ -59,11 +73,12 @@ func _boot() -> void:
 	_refresh_hud()
 
 
-func _process(delta: float) -> void:
+func _process(_delta: float) -> void:
 	if not _booted:
 		return
 	_bind_player_if_needed()
 	_sync_time_scale()
+	_detect_hitches()
 
 	if _pending_f6_toggle:
 		_pending_f6_toggle = false
@@ -76,13 +91,13 @@ func _process(delta: float) -> void:
 		_cycle_slowmo()
 	if _pending_f12_hud:
 		_pending_f12_hud = false
-		_hud.toggle_visible()
+		_hud.call(&"toggle_visible")
 
-	_hud_timer += delta
-	if _hud_timer >= 0.1:
-		_hud_timer = 0.0
+	## Use wall-clock time so the HUD keeps refreshing while time_scale is 0.
+	var now := Time.get_ticks_msec()
+	if now - _hud_last_refresh >= 100:
+		_hud_last_refresh = now
 		_refresh_hud()
-
 
 func _physics_process(_delta: float) -> void:
 	if _player == null or not is_instance_valid(_player):
@@ -93,6 +108,8 @@ func _sync_time_scale() -> void:
 	## Keep Engine.time_scale in sync with our slow-mo/pause state.
 	## If the game was paused externally (Escape menu), don't fight it.
 	if get_tree().paused and not _was_paused_by_tas:
+		return
+	if _stepping:
 		return
 	var target_scale := 0.0 if _was_paused_by_tas else SLOWMO_STEPS[_slowmo_index]
 	if not is_equal_approx(Engine.time_scale, target_scale):
@@ -107,6 +124,9 @@ func _toggle_pause() -> void:
 
 func _step() -> void:
 	## Single frame step: run at 1x for exactly one physics frame, then return to pause.
+	## Engine.time_scale is read when the engine starts a physics tick, so raising it
+	## here and lowering it again inside the physics_frame signal advances exactly one
+	## full tick; the _stepping guard keeps _sync_time_scale from undoing it early.
 	if _stepping:
 		return
 	_stepping = true
@@ -115,8 +135,8 @@ func _step() -> void:
 	Engine.time_scale = 1.0
 	await get_tree().physics_frame
 	_was_paused_by_tas = was_paused
-	_sync_time_scale()
 	_stepping = false
+	_sync_time_scale()
 	_status("stepped one tick")
 
 
@@ -333,3 +353,55 @@ func _log(message: String) -> void:
 	var gdpatch := get_node_or_null(^"/root/GDPatch")
 	if gdpatch != null and gdpatch.has_method(&"log_message"):
 		gdpatch.call(&"log_message", "info", message)
+
+
+func _detect_hitches() -> void:
+	## A hitch is a single rendered frame that advances more than one physics tick.
+	## Reads Engine state only, so it is safe to call every process frame.
+	var frame := Engine.get_physics_frames()
+	if _last_physics_frame >= 0:
+		var difference := frame - _last_physics_frame
+		if difference > 1:
+			_hitches += 1
+			_last_hitch_tick = frame
+			_log("frame hitch: %d physics ticks in one process frame at tick %d" % [
+				difference, frame
+			])
+	_last_physics_frame = frame
+
+
+func _status(message: String, error: bool = false, duration: float = 3.0) -> void:
+	_status_message = message
+	_status_error = error
+	_status_until = Time.get_ticks_msec() + int(duration * 1000.0)
+	if error:
+		_log("ERROR: " + message)
+
+
+func _refresh_hud() -> void:
+	if _hud == null:
+		return
+
+	var lines: Array[String] = []
+	lines.append("[b]SNAPTIC-TAS[/b] %s" % VERSION)
+
+	if _player == null:
+		lines.append("waiting for player...")
+	else:
+		var state := "PAUSED" if _was_paused_by_tas else "running"
+		lines.append("tick %d   %s" % [Engine.get_physics_frames(), state])
+		if _slowmo_index > 0 and not _was_paused_by_tas:
+			lines.append("slow-mo %.2fx" % SLOWMO_STEPS[_slowmo_index])
+		lines.append("hitches %d   fps %d   physics %d" % [
+			_hitches,
+			Engine.get_frames_per_second(),
+			Engine.physics_ticks_per_second,
+		])
+
+	lines.append("[color=#9fb4c8]F6 pause   F7 step   Shift+F6 slow-mo   F12 HUD[/color]")
+
+	if Time.get_ticks_msec() <= _status_until and _status_message != "":
+		var color := "#ff7070" if _status_error else "#9fe8a0"
+		lines.append("[color=%s]%s[/color]" % [color, _status_message])
+
+	_hud.call(&"set_status", lines, false)
