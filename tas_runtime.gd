@@ -6,6 +6,7 @@ extends Node
 
 const HudScript = preload("res://gdpatch/mods/snaptic_tas/tas_hud.gd")
 const SnapshotCodec = preload("res://gdpatch/mods/snaptic_tas/tas_snapshot.gd")
+const DeterminismScript = preload("res://gdpatch/mods/snaptic_tas/tas_determinism.gd")
 
 const VERSION: String = "0.2.0"
 const TICK_RATE: int = 60
@@ -19,12 +20,16 @@ const LEVELS: Dictionary = {
 	"magnet_puzzles": 7,
 }
 
+var _determinism = null
+var _pending_determinism: bool = false
+
 var _player: Node = null
 var _look_input: Node = null
 var _camera_holder: Node = null
 var _camera_manager: Node = null
 var _hitstop: Node = null
 var _hitstop_original_node: Node = null
+var _hitstop_original_t: float = 0.0
 var _hitstop_neutralized: bool = false
 
 var _hud: CanvasLayer = null
@@ -58,10 +63,21 @@ var _camera_order_enabled: bool = false
 var _old_camera_priority: int = 0
 var _look_physics_was_enabled: bool = true
 
+var _input_neutralized: bool = false
+var _look_physics_prior: bool = true
+var _buffers_physics_prior: bool = true
+
+var _last_key_time: int = 0
+var _pending_f6_toggle: bool = false
+var _pending_f7_step: bool = false
+var _pending_shift_f6_slowmo: bool = false
+var _pending_f12_hud: bool = false
+
 
 func _ready() -> void:
 	process_mode = Node.PROCESS_MODE_ALWAYS
 	process_priority = -1000
+	process_physics_priority = -1000   # run before gameplay physics each tick
 	add_to_group(&"tas_runtime")
 
 	_snapshot = SnapshotCodec.new()
@@ -95,6 +111,9 @@ func _process(_delta: float) -> void:
 	if _pending_f6_toggle:
 		_pending_f6_toggle = false
 		_toggle_pause()
+	if _pending_determinism:
+		_pending_determinism = false
+		_start_determinism()
 	if _pending_f7_step:
 		_pending_f7_step = false
 		_step()
@@ -119,7 +138,13 @@ func _process(_delta: float) -> void:
 		_hud_last_refresh = now
 		_refresh_hud()
 
+
 func _physics_process(_delta: float) -> void:
+	if _determinism != null:
+		_determinism.on_physics_tick(_determinism_inputs)
+		if _determinism.is_finished():
+			_determinism = null
+			_restore_live_input_processing()
 	if _pending_snapshot_slot >= 0:
 		var slot := _pending_snapshot_slot
 		_pending_snapshot_slot = -1
@@ -131,8 +156,6 @@ func _physics_process(_delta: float) -> void:
 
 
 func _sync_time_scale() -> void:
-	## Keep Engine.time_scale in sync with our slow-mo/pause state.
-	## If the game was paused externally (Escape menu), don't fight it.
 	if get_tree().paused and not _was_paused_by_tas:
 		return
 	if _stepping:
@@ -148,12 +171,31 @@ func _toggle_pause() -> void:
 	_status("paused" if _was_paused_by_tas else "resumed")
 
 
+func _start_determinism() -> void:
+	if _player == null or _determinism != null:
+		_status("determinism: need a player and no run in progress", true)
+		return
+	if _pending_snapshot_slot >= 0 or _pending_load_slot >= 0:
+		_status("determinism: finish pending snapshot I/O first", true)
+		return
+	var mode := int(_player.get("player_mode"))
+	if mode != 0:
+		_status("determinism: only supported in character mode (mode=%d)" % mode, true)
+		return
+	_was_paused_by_tas = false
+	_slowmo_index = 0
+	_sync_time_scale()
+	_neutralize_live_input_processing()
+	_determinism = DeterminismScript.new()
+	_determinism.start(self, _snapshot, _player)
+	_status("determinism run started", false, 5.0)
+
+
 func _step() -> void:
-	## Single frame step: run at 1x for exactly one physics frame, then return to pause.
-	## Engine.time_scale is read when the engine starts a physics tick, so raising it
-	## here and lowering it again inside the physics_frame signal advances exactly one
-	## full tick; the _stepping guard keeps _sync_time_scale from undoing it early.
 	if _stepping:
+		return
+	if _determinism != null:
+		_status("step blocked: determinism run in progress", true)
 		return
 	_stepping = true
 	var was_paused := _was_paused_by_tas
@@ -166,6 +208,76 @@ func _step() -> void:
 	_status("stepped one tick")
 
 
+func _determinism_inputs(tick: int) -> void:
+	# The determinism run is hermetic: live input is neutralized for its
+	# duration, so "nothing" here means the same thing in Pass A and Pass B.
+	if tick == 0:
+		InputBuffers.queue_jump()
+	elif tick == 30:
+		InputBuffers.queue_jump()
+
+
+func camera_tick() -> void:
+	if _player == null or not is_instance_valid(_player):
+		return
+
+
+func _neutralize_live_input_processing() -> void:
+	if _input_neutralized:
+		return
+	if _look_input != null:
+		_look_physics_prior = _look_input.is_physics_processing()
+		_look_input.set_physics_process(false)
+		_look_input.set("look_vector", Vector2.ZERO)
+		_look_input.set("time_since_last_look_input", 0.0)
+		_look_input.set("_mouse_relative", Vector2.ZERO)
+		_look_input.set("_joy_value", Vector2.ZERO)
+		_look_input.set("_button_value", Vector2.ZERO)
+	var buffers := get_node_or_null(^"/root/InputBuffers")
+	if buffers != null:
+		_buffers_physics_prior = buffers.is_physics_processing()
+		buffers.set_physics_process(false)
+	_input_neutralized = true
+
+
+func _restore_live_input_processing() -> void:
+	if not _input_neutralized:
+		return
+	if _look_input != null:
+		_look_input.set_physics_process(_look_physics_prior)
+	var buffers := get_node_or_null(^"/root/InputBuffers")
+	if buffers != null:
+		buffers.set_physics_process(_buffers_physics_prior)
+	_input_neutralized = false
+
+
+func neutralize_live_input() -> void:
+	if _look_input != null:
+		_look_input.set("look_vector", Vector2.ZERO)
+		_look_input.set("time_since_last_look_input", 0.0)
+		_look_input.set("_mouse_relative", Vector2.ZERO)
+		_look_input.set("_joy_value", Vector2.ZERO)
+		_look_input.set("_button_value", Vector2.ZERO)
+	var buffers := get_node_or_null(^"/root/InputBuffers")
+	if buffers == null:
+		return
+	buffers.set("_smash_input", false)
+	buffers.set("helicopter_input", false)
+	buffers.set("_do_marble_buffer_timer", 0.0)
+	buffers.set("_jump_buffer_timer", 0.0)
+	buffers.set("_smash_input_timer", 0.0)
+	buffers.set("_do_marble_press_msec", 0)
+	buffers.set("_do_marble_is_double", false)
+	buffers.set("_double_marble_open_msec", 0)
+	buffers.set("_old_smash_input", false)
+	buffers.set("_was_do_marble_pressed", false)
+	buffers.set("_prev_stick_angle", 0.0)
+	buffers.set("_prev_stick_magnitude", 0.0)
+	buffers.set("_stick_cumulitave_angle", 0.0)
+	buffers.set("_avg_stick_angular_speed", [])
+	buffers.set("_helicopter_buffer_i", 0)
+
+
 func _cycle_slowmo() -> void:
 	_slowmo_index = (_slowmo_index + 1) % SLOWMO_STEPS.size()
 	_sync_time_scale()
@@ -176,6 +288,9 @@ func _cycle_slowmo() -> void:
 
 
 func _save_snapshot(cycle: bool) -> void:
+	if _determinism != null:
+		_status("snapshot blocked: determinism run in progress", true)
+		return
 	if cycle:
 		_slot = (_slot + 1) % SNAPSHOT_SLOTS
 		_status("snapshot slot %d (%s)" % [_slot, _slot_summary(_slot)])
@@ -208,6 +323,9 @@ func _capture_slot(slot: int) -> void:
 
 
 func _load_snapshot(cycle: bool) -> void:
+	if _determinism != null:
+		_status("snapshot load blocked: determinism run in progress", true)
+		return
 	if cycle:
 		_slot = (_slot - 1 + SNAPSHOT_SLOTS) % SNAPSHOT_SLOTS
 		_status("snapshot slot %d (%s)" % [_slot, _slot_summary(_slot)])
@@ -245,12 +363,6 @@ func _apply_snapshot_slot(slot: int) -> void:
 
 
 func _snap_view() -> void:
-	## The snapshot restores the player bodies and the camera holder transform, but
-	## the camera spring arm keeps its own lag point (ShapeCast3D). The camera manager
-	## recomputes the holder from that lag point every physics tick, even when
-	## Engine.time_scale is 0, which would drag the camera back to its pre-load spot.
-	## Push the restored transforms through the followers and snap the active camera
-	## controllers so the player and camera are correct before the next unpause.
 	if _player == null or not is_instance_valid(_player):
 		return
 	if _player.has_method(&"snap_followers"):
@@ -259,11 +371,6 @@ func _snap_view() -> void:
 
 
 func _apply_paused_freelook() -> void:
-	## While TAS-paused the camera controllers still consume look input: LookInput
-	## builds a look vector every physics tick and the rotation controller rotates
-	## its target basis, but delta-based damping cannot move the holder at delta 0.
-	## Snap the holder to the rotated target so the mouse looks around immediately
-	## instead of the view only catching up on unpause.
 	if _player == null or not is_instance_valid(_player):
 		return
 	_snap_camera()
@@ -311,6 +418,7 @@ func _on_player_bound() -> void:
 			_old_camera_priority = int(_camera_manager.process_priority)
 	_hitstop = _player.get("hitstop_component")
 	_hitstop_original_node = null
+	_hitstop_original_t = 0.0
 	_hitstop_neutralized = false
 	if _snapshot != null:
 		_snapshot.bind(_player)
@@ -325,6 +433,7 @@ func _on_player_bound() -> void:
 func _on_player_lost() -> void:
 	if _snapshot != null:
 		_snapshot.unbind()
+	_restore_live_input_processing()
 	_restore_look_physics()
 	_restore_hitstop()
 	_restore_camera_order()
@@ -337,6 +446,7 @@ func _on_player_lost() -> void:
 	_camera_manager = null
 	_hitstop = null
 	_hitstop_original_node = null
+	_hitstop_original_t = 0.0
 	_hitstop_neutralized = false
 	_status("player lost; waiting", false, 3.0)
 
@@ -381,6 +491,8 @@ func _neutralize_hitstop() -> void:
 	if _hitstop == null or _hitstop_neutralized:
 		return
 	_hitstop_original_node = _hitstop.get("node_to_pause")
+	var t = _hitstop.get("_t")
+	_hitstop_original_t = float(t) if t != null else 0.0
 	_hitstop.set("node_to_pause", null)
 	_hitstop.set("_t", 0.0)
 	_hitstop_neutralized = true
@@ -394,6 +506,7 @@ func _restore_hitstop() -> void:
 		_hitstop.set("node_to_pause", _hitstop_original_node)
 	else:
 		_hitstop.set("node_to_pause", null)
+	_hitstop.set("_t", _hitstop_original_t)
 	_hitstop_neutralized = false
 
 
@@ -401,6 +514,8 @@ func _ensure_player_process_modes() -> void:
 	if _player == null or not is_instance_valid(_player):
 		return
 	var mode := int(_player.get("player_mode"))
+	if mode == 2:
+		return
 	var characterbody: Node = _player.get("characterbody")
 	var marble: Node = _player.get("marble")
 	_player.set("process_mode", Node.PROCESS_MODE_INHERIT)
@@ -420,12 +535,6 @@ func _restore_look_physics() -> void:
 	_look_input.set(&"_button_value", Vector2.ZERO)
 
 
-var _last_key_time: int = 0
-var _pending_f6_toggle: bool = false
-var _pending_f7_step: bool = false
-var _pending_shift_f6_slowmo: bool = false
-var _pending_f12_hud: bool = false
-
 func _input(event: InputEvent) -> void:
 	if not (event is InputEventKey):
 		return
@@ -436,6 +545,8 @@ func _input(event: InputEvent) -> void:
 
 	var handled := true
 	match key:
+		KEY_F10:
+			_pending_determinism = true
 		KEY_F6:
 			if key_event.shift_pressed:
 				_pending_shift_f6_slowmo = true
@@ -457,6 +568,7 @@ func _input(event: InputEvent) -> void:
 
 
 func _exit_tree() -> void:
+	_restore_live_input_processing()
 	_restore_look_physics()
 	_restore_hitstop()
 	_restore_camera_order()
@@ -506,8 +618,9 @@ func _log(message: String) -> void:
 
 
 func _detect_hitches() -> void:
-	## A hitch is a single rendered frame that advances more than one physics tick.
-	## Reads Engine state only, so it is safe to call every process frame.
+	if _was_paused_by_tas:
+		_last_physics_frame = Engine.get_physics_frames()
+		return
 	var frame := Engine.get_physics_frames()
 	if _last_physics_frame >= 0:
 		var difference := frame - _last_physics_frame
@@ -526,6 +639,53 @@ func _status(message: String, error: bool = false, duration: float = 3.0) -> voi
 	_status_until = Time.get_ticks_msec() + int(duration * 1000.0)
 	if error:
 		_log("ERROR: " + message)
+
+
+func _telemetry_lines() -> Array[String]:
+	var out: Array[String] = []
+	if _player == null or not is_instance_valid(_player):
+		return out
+
+	var mode := int(_player.get("player_mode"))
+	var body: Node3D = _player.get_current_body() as Node3D
+	var vc: Node = _player.get("velocity_component")
+
+	var pos := Vector3.ZERO
+	if body != null:
+		pos = body.global_position
+
+	var velocity := Vector3.ZERO
+	if vc != null:
+		var v = vc.get("velocity")
+		if v is Vector3:
+			velocity = v
+
+	var grounded := false
+	if body is CharacterBody3D:
+		grounded = (body as CharacterBody3D).is_on_floor()
+	elif body != null:
+		grounded = bool(body.get("_is_on_floor"))
+
+	var top_state := "?"
+	var top_sm: Node = _player.get("state_machine")
+	if top_sm != null and top_sm.get("current_state") != null:
+		top_state = String(top_sm.get("current_state").name)
+
+	var move_state := "?"
+	var move_sm: Node = _player.get("movement_state_machine")
+	if move_sm != null and move_sm.get("current_state") != null:
+		move_state = String(move_sm.get("current_state").name)
+
+	var horizontal := Vector2(velocity.x, velocity.z).length()
+
+	out.append("pos  %.2f  %.2f  %.2f" % [pos.x, pos.y, pos.z])
+	out.append("vel  h %.2f   v %.2f" % [horizontal, velocity.y])
+	out.append("state %s / %s" % [top_state, move_state])
+	out.append("%s   %s" % [
+		"grounded" if grounded else "airborne",
+		"marble" if mode == 1 else "character",
+	])
+	return out
 
 
 func _refresh_hud() -> void:
@@ -547,6 +707,7 @@ func _refresh_hud() -> void:
 			Engine.get_frames_per_second(),
 			Engine.physics_ticks_per_second,
 		])
+		lines.append_array(_telemetry_lines())
 		lines.append("snapshot slot %d   %s" % [_slot, _slot_summary(_slot)])
 
 	lines.append("[color=#9fb4c8]F6 pause   F7 step   Shift+F6 slow-mo   F12 HUD[/color]")

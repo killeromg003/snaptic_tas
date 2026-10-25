@@ -40,7 +40,6 @@ func _boot() -> void:
 	await get_tree().process_frame
 
 	var errors: Array[String] = []
-	var warnings: Array[String] = []
 
 	var version := Engine.get_version_info()
 	var found_engine := "%d.%d.%d" % [
@@ -61,6 +60,9 @@ func _boot() -> void:
 		errors.append("physics tick rate must be %d; found %d" % [
 			REQUIRED_TICK_RATE, Engine.physics_ticks_per_second
 		])
+
+	if not is_equal_approx(Engine.time_scale, 1.0):
+		errors.append("Engine.time_scale must be 1.0 at boot; found %s" % str(Engine.time_scale))
 
 	var jitter = ProjectSettings.get_setting("physics/common/physics_jitter_fix", null)
 	if jitter == null:
@@ -84,10 +86,6 @@ func _boot() -> void:
 		if not ResourceLoader.exists(path):
 			errors.append("expected script/scene missing: " + path)
 
-	if not warnings.is_empty():
-		for warning in warnings:
-			_log("warning: " + warning)
-
 	if not errors.is_empty():
 		_show_error(errors)
 		return
@@ -98,6 +96,9 @@ func _boot() -> void:
 		return
 
 	_runtime = runtime_script.new()
+	if _runtime == null:
+		_show_error(["Could not instantiate tas_runtime.gd (missing class_name or _init error)."])
+		return
 	_runtime.name = "TASRuntime"
 	add_child(_runtime)
 	_log("enabled: SNAPTIC %s / Godot %s / %d Hz" % [

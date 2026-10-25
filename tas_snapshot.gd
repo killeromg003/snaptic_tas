@@ -245,28 +245,46 @@ func restore(player: Node, snapshot: Dictionary) -> Dictionary:
 		"top_current": state_machines.get("top", {}).get("current", ""),
 		"movement_current": state_machines.get("movement", {}).get("current", ""),
 	}
-	Callable(self, "_deferred_reapply").call_deferred(player, deferred)
+	_deferred_reapply(player, deferred)
 	return {"ok": true, "reason": ""}
 
+func active_only(sim: Dictionary) -> Dictionary:
+	var out := sim.duplicate(true)
+	var mode := int(sim.get("player", {}).get("mode", 0))
+	if mode == 0:
+		out.erase("marble")
+	else:
+		out.erase("characterbody")
+	return out
 
 func hash(snapshot: Dictionary) -> int:
-	var camera: Dictionary = snapshot.get("camera", {})
+	var sim: Dictionary
+	var camera: Dictionary
+	if snapshot.has("sim") and snapshot.get("sim") is Dictionary:
+		sim = snapshot.get("sim", {})
+		camera = snapshot.get("camera", {})
+	else:
+		sim = snapshot
+		camera = {}
+
 	var rotation_controllers: Array = []
 	for entry in camera.get("controllers", []):
 		if entry.get("kind", "") == "rotation":
 			rotation_controllers.append(entry)
+	# Sort by path so that even if a caller builds the controllers array in
+	# a non-deterministic order, the hash is stable. The camera manager's
+	# internal array order can change on activation, which would otherwise
+	# make two identical camera states hash differently.
+	rotation_controllers.sort_custom(
+		func(a, b): return str(a.get("path", "")) < str(b.get("path", ""))
+	)
 
 	var holder_transform: Transform3D = camera.get("holder_transform", Transform3D.IDENTITY)
 	var payload := {
-		"format": snapshot.get("format", FORMAT_VERSION),
-		"level": snapshot.get("level", -1),
-		"sim": snapshot.get("sim", {}),
+		"format": int(snapshot.get("format", FORMAT_VERSION)),
+		"level": int(snapshot.get("level", -1)),
+		"sim": active_only(sim),      # ← was: sim
 		"camera_rotation": {
-			"target_basis": camera.get("target_basis", Basis.IDENTITY),
-			"holder_basis": holder_transform.basis,
-			"controllers": rotation_controllers,
-			"prev_rotation_leader": camera.get("prev_rotation_leader", ""),
-			"needs_sorting": camera.get("needs_sorting", false),
 		},
 	}
 	var context := HashingContext.new()
@@ -406,7 +424,6 @@ func _capture_checkpoint(player: Node) -> Dictionary:
 		"fallback": _prop(checkpoint, "_fallback_position", Vector3.ZERO),
 	}
 
-
 func _capture_camera() -> Dictionary:
 	var controllers: Array = []
 	var rotation_probe: Node = null
@@ -432,6 +449,13 @@ func _capture_camera() -> Dictionary:
 					"kind": kind,
 					"vars": _capture_vars(controller),
 				})
+
+	# Sort by path so the snapshot is independent of the manager's internal
+	# array order. The manager re-sorts on activation changes, which would
+	# otherwise make two identical camera states hash differently.
+	controllers.sort_custom(
+		func(a, b): return str(a.get("path", "")) < str(b.get("path", ""))
+	)
 
 	return {
 		"target_basis": _prop(rotation_probe, "camera_target_basis", Basis.IDENTITY),
@@ -487,7 +511,6 @@ func _restore_characterbody(body: Node, saved: Dictionary) -> void:
 		contact_ids[int(key)] = bool(saved_ids[key])
 	body.set("_contact_ids", contact_ids)
 
-
 func _restore_marble(body: Node, saved: Dictionary) -> void:
 	if body == null or saved.is_empty():
 		return
@@ -509,10 +532,24 @@ func _restore_marble(body: Node, saved: Dictionary) -> void:
 	body.set("_contact_normal", saved.get("contact_normal", Vector3.UP))
 	body.set("sleeping", bool(saved.get("sleeping", false)))
 
+	# Force the physics server to synchronize its per-body state immediately
+	# rather than deferring to the next physics step. Without this, the next
+	# _integrate_forces call reads the pre-restore transform, and the CCD
+	# correction in CustomRigidBody3D applies a different shortfall in Pass B
+	# than in Pass A, causing marble drift at tick 1.
+	if body is RigidBody3D:
+		var rid: RID = (body as RigidBody3D).get_rid()
+		PhysicsServer3D.body_set_state(rid, PhysicsServer3D.BODY_STATE_TRANSFORM,
+			saved.get("transform", Transform3D.IDENTITY))
+		PhysicsServer3D.body_set_state(rid, PhysicsServer3D.BODY_STATE_LINEAR_VELOCITY,
+			saved.get("linear_velocity", Vector3.ZERO))
+		PhysicsServer3D.body_set_state(rid, PhysicsServer3D.BODY_STATE_ANGULAR_VELOCITY,
+			saved.get("angular_velocity", Vector3.ZERO))
+		PhysicsServer3D.body_set_state(rid, PhysicsServer3D.BODY_STATE_SLEEPING, false)
+
 	var magnet: Node = body.get("magnet")
 	if magnet != null:
 		magnet.set("nearest_overlapping", _resolve(str(saved.get("magnet_nearest", ""))))
-
 
 func _restore_velocity_component(component: Node, saved: Dictionary) -> void:
 	if component == null or saved.is_empty():

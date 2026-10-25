@@ -2,7 +2,13 @@ id = "snaptic_tas"
 
 [meta]
 name = "SNAPTIC-TAS"
-version = "0.1.0"
+version = "0.2.0"
 authors = ["killeromg003"]
-description = "TAS tool"
+description = "TAS tool: pause, frame-step, slow-mo, snapshots, freelook while paused."
 
+[config.debug]
+[config.debug.autoload_level]
+name = "Auto-load level"
+description = "Testing only. Load this level on startup: gym, test_room, movement_playtest, mirraxis, or magnet_puzzles. Empty means the normal menu."
+type = "string"
+default = ""
