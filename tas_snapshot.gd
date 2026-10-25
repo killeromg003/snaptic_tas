@@ -52,6 +52,7 @@ const BLOCKED_VARS: Array[String] = [
 ]
 
 const INPUT_BUFFER_FIELDS: Array[String] = [
+	"_tas_game_msec",
 	"_smash_input",
 	"helicopter_input",
 	"_do_marble_buffer_timer",
@@ -509,6 +510,32 @@ func _restore_characterbody(body: Node, saved: Dictionary) -> void:
 	for key in saved_ids:
 		contact_ids[int(key)] = bool(saved_ids[key])
 	body.set("_contact_ids", contact_ids)
+
+	# CharacterBody3D derives is_on_floor()/is_on_wall() from its last move and
+	# exposes no setter. Without rebuilding them, the first tick after a restore
+	# reads the contact state left by whatever moved last (for Pass B: the end
+	# of Pass A), so an airborne snapshot taken right after a grounded tick sees
+	# is_on_floor() == true once and changes has_do_marble / has_ground_pound.
+	# Rebuild the floor flag from the saved value and put the transform and
+	# velocity back, so the tick still starts from the recorded state.
+	if Engine.is_in_physics_frame() and body is CharacterBody3D:
+		_refresh_floor_state(body as CharacterBody3D, bool(saved.get("was_on_floor", false)))
+
+
+func _refresh_floor_state(body: CharacterBody3D, was_on_floor: bool) -> void:
+	var transform: Transform3D = body.global_transform
+	var velocity: Vector3 = body.velocity
+	# A tiny upward move clears the cached floor flag (floor snapping is skipped
+	# for upward velocities), then the saved flag is rebuilt with a floor snap.
+	body.velocity = body.up_direction * 0.01
+	body.move_and_slide()
+	body.global_transform = transform
+	if was_on_floor:
+		body.velocity = Vector3.ZERO
+		body.apply_floor_snap()
+		body.global_transform = transform
+	body.velocity = velocity
+
 
 func _restore_marble(body: Node, saved: Dictionary) -> void:
 	if body == null or saved.is_empty():

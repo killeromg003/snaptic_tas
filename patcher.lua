@@ -1,10 +1,15 @@
--- SNAPTIC-TAS GDPatch patcher (simplified)
+-- SNAPTIC-TAS GDPatch patcher
 --
--- Only two game scripts are edited, plus two project settings:
---   autoloads/input/game_input.gd          (adds patch marker only)
---   autoloads/input/input_buffers.gd       (deterministic timer fix + patch marker)
+-- Four game scripts are edited, plus two project settings:
+--   autoloads/input/game_input.gd                        (adds patch marker only)
+--   autoloads/input/input_buffers.gd                     (tick-based timers, slow-mo input)
+--   actors/player/player_states/player_aerial_state.gd   (render timer -> physics)
+--   actors/player/player_states/player_bhopping_state.gd (render timer -> physics)
 --   physics/common/physics_ticks_per_second = 60
 --   physics/common/physics_jitter_fix = 0.0
+--
+-- Every patch is anchored and fails closed: if an anchor is missing the script
+-- is left untouched, its marker is not added, and mod.gd refuses to start.
 
 local MOD_ID = "snaptic_tas"
 
@@ -23,6 +28,27 @@ local function replace_once(source, old, new, label)
     return nil
   end
   return source:sub(1, first - 1) .. new .. source:sub(last + 1)
+end
+
+-- Insert a line after the (unique) line that starts with `prefix`. Used where
+-- the rest of the line varies between the recovered source and the shipped
+-- script (parameter names, formatting), so a whole-line anchor is brittle.
+local function insert_line_after(source, prefix, line, label)
+  local first = source:find(prefix, 1, true)
+  if not first then
+    log("missing anchor: " .. label)
+    return nil
+  end
+  if source:find(prefix, first + 1, true) then
+    log("anchor is not unique: " .. label)
+    return nil
+  end
+  local eol = source:find("\n", first, true)
+  if not eol then
+    log("missing line end: " .. label)
+    return nil
+  end
+  return source:sub(1, eol) .. line .. source:sub(eol + 1)
 end
 
 local function has_marker(source)
@@ -80,6 +106,9 @@ local function patch_input_buffers(source)
     "func _physics_process(delta: float):\n" ..
     "\tif Engine.is_editor_hint():\n" ..
     "\t\treturn\n" ..
+    "\tif delta <= 0.0:\n" ..
+    "\t\treturn\n" ..
+    "\t_tas_game_msec += delta * 1000.0\n" ..
     "\t_do_marble_buffer_timer = max(_do_marble_buffer_timer - delta, 0.0)\n" ..
     "\t_jump_buffer_timer = max(_jump_buffer_timer - delta, 0.0)\n" ..
     "\tif _was_do_marble_pressed and GameInput.get_action_strength(&\"do_marble\") < 0.3:\n" ..
@@ -91,13 +120,66 @@ local function patch_input_buffers(source)
     return source
   end
 
+  -- The stick is sampled once per physics tick, so angular speed must be
+  -- divided by the unscaled tick length. The original delta is multiplied by
+  -- Engine.time_scale, which made the helicopter threshold fire at 2x/4x the
+  -- real rotation speed in 0.5x/0.25x slow-mo and divide by zero while paused.
+  patched = replace_once(
+    patched,
+    "\tvar stick_angular_speed = angle_diff / delta",
+    "\tvar tick_delta: float = 1.0 / float(Engine.physics_ticks_per_second)\n" ..
+    "\tvar stick_angular_speed = angle_diff / tick_delta",
+    "input_buffers slow-mo helicopter speed")
+  if not patched then
+    return source
+  end
+
   patched = patched ..
+    "\nvar _tas_game_msec: float = 0.0\n" ..
     "\nfunc _tas_now_msec() -> int:\n" ..
-    "\treturn int(Engine.get_physics_frames() * 1000.0 / 60.0)\n" ..
+    "\treturn int(_tas_game_msec)\n" ..
     "\nfunc tas_patch_marker() -> int:\n" ..
     "\treturn 1\n"
 
   log("patched input_buffers.gd")
+  return patched
+end
+
+-- Both Aerial and Bhopping advance a squash timer in _process(delta), i.e. in
+-- render time. The value is only used for the stretch animation, but it is
+-- script state, so it differed between two runs of the same inputs (and was
+-- captured by TAS snapshots). Move the increment into the physics tick; the
+-- visual sampling stays in _process.
+local SQUASH_OLD_PROCESS =
+  "func _process(delta: float):\n" ..
+  "\t_stretch_timer += delta\n" ..
+  "\tif not stretch_curve or not squashable_node:\n" ..
+  "\t\treturn"
+
+local SQUASH_NEW_PROCESS =
+  "func _process(_delta: float):\n" ..
+  "\tif not stretch_curve or not squashable_node:\n" ..
+  "\t\treturn"
+
+local function patch_squash_timer(source, label)
+  if has_marker(source) then
+    return source
+  end
+
+  local patched = replace_once(source, SQUASH_OLD_PROCESS, SQUASH_NEW_PROCESS, label .. " render timer removal")
+  if not patched then
+    return source
+  end
+
+  patched = insert_line_after(patched, "func _physics_process(", "\t_stretch_timer += delta\n", label .. " physics timer move")
+  if not patched then
+    return source
+  end
+
+  patched = patched ..
+    "\nfunc tas_patch_marker() -> int:\n" ..
+    "\treturn 1\n"
+  log("patched " .. label)
   return patched
 end
 
@@ -133,6 +215,10 @@ local targets = {
   "autoloads/input/game_input.gdc",
   "autoloads/input/input_buffers.gd",
   "autoloads/input/input_buffers.gdc",
+  "actors/player/player_states/player_aerial_state.gd",
+  "actors/player/player_states/player_aerial_state.gdc",
+  "actors/player/player_states/player_bhopping_state.gd",
+  "actors/player/player_states/player_bhopping_state.gdc",
 }
 
 GDPatch.patch_script_as_text(targets, function(ctx, source)
@@ -142,6 +228,12 @@ GDPatch.patch_script_as_text(targets, function(ctx, source)
   end
   if path:find("input_buffers.gd", 1, true) then
     return patch_input_buffers(source)
+  end
+  if path:find("player_aerial_state.gd", 1, true) then
+    return patch_squash_timer(source, "player_aerial_state.gd")
+  end
+  if path:find("player_bhopping_state.gd", 1, true) then
+    return patch_squash_timer(source, "player_bhopping_state.gd")
   end
   return source
 end)

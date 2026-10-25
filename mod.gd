@@ -8,14 +8,23 @@ extends Node
 ## mismatch it shows an error HUD and leaves the game running unmodified (the
 ## Lua patches are anchored and fail closed, but they may still be present).
 
-const TOOL_VERSION: String = "0.3.0"
+const TOOL_VERSION: String = "0.4.0"
 const REQUIRED_ENGINE: String = "4.7.1"
 const REQUIRED_GAME: String = "0.91"
 const REQUIRED_TICK_RATE: int = 60
 
+## Scripts that carry a runtime patch marker (see patcher.lua). They are not
+## autoloads, so the marker is looked up in the script method list.
+const PATCHED_PLAYER_STATES: Array[String] = [
+	"res://actors/player/player_states/player_aerial_state.gd",
+	"res://actors/player/player_states/player_bhopping_state.gd",
+]
+
 const REQUIRED_PATHS: Array[String] = [
 	"res://actors/player/player.gd",
 	"res://actors/player/player.tscn",
+	"res://actors/player/player_states/player_aerial_state.gd",
+	"res://actors/player/player_states/player_bhopping_state.gd",
 	"res://actors/player/player_states/player_marble_state.gd",
 	"res://autoloads/global/global.gd",
 	"res://autoloads/input/look_input.gd",
@@ -82,6 +91,10 @@ func _boot() -> void:
 	elif not input_buffers.has_method(&"tas_patch_marker"):
 		errors.append("input_buffers.gd patch marker missing (unsupported game build)")
 
+	for path in PATCHED_PLAYER_STATES:
+		if not _script_has_marker(path):
+			errors.append(path.get_file() + " patch marker missing (unsupported game build)")
+
 	for path in REQUIRED_PATHS:
 		if not ResourceLoader.exists(path):
 			errors.append("expected script/scene missing: " + path)
@@ -117,6 +130,16 @@ func _boot() -> void:
 	_log("enabled: SNAPTIC %s / Godot %s / %d Hz" % [
 		game_version, found_engine, Engine.physics_ticks_per_second
 	])
+
+
+func _script_has_marker(path: String) -> bool:
+	var script: Script = load(path)
+	if script == null:
+		return false
+	for method in script.get_script_method_list():
+		if str(method.get("name", "")) == "tas_patch_marker":
+			return true
+	return false
 
 
 func _show_error(errors: Array[String]) -> void:

@@ -5,7 +5,7 @@ extends RefCounted
 ## Pass A and Pass B share identical code paths through on_physics_tick().
 
 const TICKS: int = 120
-const SNAPSHOT_KEEP: int = 3   # keep first N snapshots per pass for diagnostics
+const SNAPSHOT_KEEP: int = TICKS   # snapshots kept per pass so any drifting tick can be diffed
 
 var _codec: RefCounted = null
 var _player: Node = null
@@ -142,24 +142,40 @@ func _report() -> void:
 		)
 		return
 
+	var drift_ticks: int = 0
+	var first_drift: int = -1
+	var details_left: int = 8
 	for i in _hashes_a.size():
-		if _hashes_a[i] != _hashes_b[i]:
+		if _hashes_a[i] == _hashes_b[i]:
+			continue
+		drift_ticks += 1
+		if first_drift < 0:
+			first_drift = i
+		if drift_ticks <= 8:
 			print("SNAPTIC-TAS determinism: DRIFT at tick offset %d" % i)
+		elif drift_ticks == 9:
+			print("SNAPTIC-TAS determinism: ... more drifting ticks suppressed")
 
-			if i < _snaps_a.size() and i < _snaps_b.size():
-				var sim_a: Dictionary = _snaps_a[i].get("sim", {})
-				var sim_b: Dictionary = _snaps_b[i].get("sim", {})
-				var active_a: Dictionary = _codec.active_only(sim_a)
-				var active_b: Dictionary = _codec.active_only(sim_b)
-				print("SNAPTIC-TAS determinism: tick-%d active-sim field diff (A vs B):" % i)
-				var diff_count: int = _diff(active_a, active_b, "")
-				print("SNAPTIC-TAS determinism: tick-%d differing fields: %d" % [i, diff_count])
-			return
+		if details_left > 0 and i < _snaps_a.size() and i < _snaps_b.size():
+			details_left -= 1
+			var sim_a: Dictionary = _snaps_a[i].get("sim", {})
+			var sim_b: Dictionary = _snaps_b[i].get("sim", {})
+			var active_a: Dictionary = _codec.active_only(sim_a)
+			var active_b: Dictionary = _codec.active_only(sim_b)
+			print("SNAPTIC-TAS determinism: tick-%d active-sim field diff (A vs B):" % i)
+			var diff_count: int = _diff(active_a, active_b, "")
+			print("SNAPTIC-TAS determinism: tick-%d differing fields: %d" % [i, diff_count])
 
-	print(
-		"SNAPTIC-TAS determinism: DETERMINISTIC over %d ticks"
-		% _hashes_a.size()
-	)
+	if drift_ticks == 0:
+		print(
+			"SNAPTIC-TAS determinism: DETERMINISTIC over %d ticks"
+			% _hashes_a.size()
+		)
+	else:
+		print(
+			"SNAPTIC-TAS determinism: NON-DETERMINISTIC: %d / %d ticks differ, first at tick offset %d"
+			% [drift_ticks, _hashes_a.size(), first_drift]
+		)
 
 
 func _diff(a: Dictionary, b: Dictionary, path: String) -> int:

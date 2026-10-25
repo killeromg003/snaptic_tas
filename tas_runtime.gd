@@ -8,7 +8,7 @@ const DeterminismScript = preload("res://gdpatch/mods/snaptic_tas/tas_determinis
 const InputScript       = preload("res://gdpatch/mods/snaptic_tas/tas_input.gd")
 const RunfileScript     = preload("res://gdpatch/mods/snaptic_tas/tas_runfile.gd")
 
-const VERSION: String = "0.2.0"
+const VERSION: String = "0.4.0"
 const TICK_RATE: int = 60
 const SNAPSHOT_SLOTS: int = 10
 const SLOWMO_STEPS: Array[float] = [1.0, 0.5, 0.25]
@@ -87,6 +87,8 @@ var _status_until: int = 0
 var _hud_last_refresh: int = 0
 var _booted: bool = false
 var _debug_level: String = ""
+var _det_autostart: bool = false
+var _det_autostart_air: bool = false
 
 # ── Camera ────────────────────────────────────────────────────────────────────
 var _camera_order_enabled: bool = false
@@ -129,6 +131,8 @@ func _ready() -> void:
 	_game_input = get_node_or_null(^"/root/GameInput")
 	_look_input  = get_node_or_null(^"/root/LookInput")
 	_debug_level = _read_debug_level()
+	_det_autostart = _has_cmdline_arg("--tas-det")
+	_det_autostart_air = _has_cmdline_arg("--tas-det-air")
 
 	_log("runtime ready (version %s, debug level '%s')" % [VERSION, _debug_level])
 	call_deferred("_boot")
@@ -140,6 +144,32 @@ func _boot() -> void:
 		await _try_autoload_level(_debug_level)
 	_booted = true
 	_refresh_hud()
+	if _det_autostart:
+		_autostart_determinism()
+
+
+## Developer hook (`--tas-det`): run the determinism check as soon as the player
+## is bound and standing, so it can be reproduced headlessly without injecting
+## Ctrl+F10. `--tas-det-air` starts from a falling player instead, which exercises
+## the restore path for the engine-side floor state.
+func _autostart_determinism() -> void:
+	for i in 1800:
+		if _player != null and is_instance_valid(_player) and int(_player.get("player_mode")) == 0:
+			if bool(_player.call(&"is_on_floor")):
+				break
+		await get_tree().process_frame
+	if _player == null or not is_instance_valid(_player):
+		_log("determinism autostart: no player bound")
+		return
+	if _det_autostart_air:
+		# Give the engine one move-and-slide to clear its cached floor state.
+		var body = _player.get("characterbody")
+		if body != null:
+			body.set("global_position", body.get("global_position") + Vector3.UP * 2.0)
+		for i in 6:
+			await get_tree().physics_frame
+	await get_tree().physics_frame
+	_start_determinism()
 
 
 func _exit_tree() -> void:
@@ -919,6 +949,16 @@ func _status(message: String, error: bool = false, duration: float = 3.0) -> voi
 	_status_until   = Time.get_ticks_msec() + int(duration * 1000.0)
 	if error:
 		_log("ERROR: " + message)
+
+
+func _has_cmdline_arg(flag: String) -> bool:
+	for argument in OS.get_cmdline_args():
+		if argument == flag:
+			return true
+	for argument in OS.get_cmdline_user_args():
+		if argument == flag:
+			return true
+	return false
 
 
 func _read_debug_level() -> String:

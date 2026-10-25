@@ -12,6 +12,8 @@ extends Node
 ##   - which of the player's VFX nodes are active, plus their amount ratio
 ##   - one-shot VFX triggers (tick + which node) so retriggers are not lost
 ##   - impact bursts from Global.impact_particles (tick + position)
+## and, every other tick:
+##   - the player rig's bone poses, rig offset and head offset (see below)
 ##
 ## Hotkeys
 ##   F8    start / stop recording (saves on stop)
@@ -20,13 +22,22 @@ extends Node
 ##   Shift+F10  unload the ghost
 
 const TICK_RATE: int = 60
-const FORMAT_VERSION: int = 2
+const FORMAT_VERSION: int = 3
 
 ## px, py, pz, yaw, state_index, player_mode
 const BASE_FLOATS: int = 6
 
 ## Per VFX node: active, amount_ratio
 const VFX_FLOATS: int = 2
+
+## Skeleton poses are sampled every other tick (30 Hz) and interpolated.
+const RIG_SAMPLE_EVERY: int = 2
+
+## One Transform3D is stored as 12 floats: three basis columns, then origin.
+const RIG_XFORM_FLOATS: int = 12
+
+## Per skeleton sample: body -> skeleton offset, then skeleton -> head offset.
+const RIG_BASE_FLOATS: int = RIG_XFORM_FLOATS * 2
 
 const MAX_FRAMES: int = 72000          # 20 minutes at 60 Hz
 const GHOST_PATH: String = "user://snaptic_tas_ghost.dat"
@@ -72,6 +83,26 @@ var _impact_positions: PackedVector3Array = PackedVector3Array()
 var _impact_next: int = 0
 var _impact_was_emitting: bool = false
 var _live_impacts: Array = []
+
+## Skeleton ghost. One sample is RIG_BASE_FLOATS + RIG_XFORM_FLOATS * bones.
+## The bone poses are global poses in skeleton space, exactly like the game's
+## own RigAfterimageVFX records them on a flat skeleton.
+var _rig_bones: PackedStringArray = PackedStringArray()
+var _rig_body_path: String = ""
+var _rig_head_path: String = ""
+var _rig_ticks: PackedInt32Array = PackedInt32Array()
+var _rig_samples: PackedFloat32Array = PackedFloat32Array()
+var _rig_stride: int = 0
+
+## Live player rig while recording.
+var _rig_skeleton_src: Skeleton3D = null
+var _rig_head_src: MeshInstance3D = null
+
+## Ghost skeleton built for playback.
+var _rig_skeleton: Skeleton3D = null
+var _rig_head: MeshInstance3D = null
+var _rig_ready: bool = false
+var _rig_failed: bool = false
 
 var _ghost: Node3D = null
 var _capsule: MeshInstance3D = null
@@ -175,6 +206,7 @@ func _physics_process(_delta: float) -> void:
 		_note("recording cap reached (%d ticks)" % MAX_FRAMES)
 		return
 
+	var tick := _frame_count()
 	var xform := body.global_transform
 	var pos := xform.origin
 	var yaw := xform.basis.get_euler().y
@@ -190,6 +222,9 @@ func _physics_process(_delta: float) -> void:
 	_frames.append(float(player_mode))
 
 	_append_vfx_frame(player)
+
+	if _rig_skeleton_src != null and tick % RIG_SAMPLE_EVERY == 0:
+		_append_rig_sample(tick, body)
 
 
 func _append_vfx_frame(player: Node) -> void:
@@ -315,6 +350,16 @@ func _start_recording() -> void:
 	_impact_was_emitting = false
 	_cursor = 0.0
 
+	_rig_bones = PackedStringArray()
+	_rig_body_path = ""
+	_rig_head_path = ""
+	_rig_ticks = PackedInt32Array()
+	_rig_samples = PackedFloat32Array()
+	_rig_stride = 0
+	_rig_skeleton_src = null
+	_rig_head_src = null
+	var has_rig := _find_rig(player)
+
 	_player_to_body = body.global_transform.affine_inverse() * (player as Node3D).global_transform
 	_vfx_defs = _collect_vfx_defs(player)
 	_stride = BASE_FLOATS + VFX_FLOATS * _vfx_defs.size()
@@ -322,7 +367,10 @@ func _start_recording() -> void:
 	_vfx_was_active.resize(_vfx_defs.size())
 	_connect_vfx_signals(player)
 
-	_note("recording (%d vfx channels)" % _vfx_defs.size())
+	if has_rig:
+		_note("recording (%d vfx channels, %d bones)" % [_vfx_defs.size(), _rig_bones.size()])
+	else:
+		_note("recording (%d vfx channels, proxy only)" % _vfx_defs.size())
 
 
 func _stop_recording() -> void:
@@ -406,13 +454,15 @@ func _apply(cursor: float) -> void:
 	_ghost.global_transform = xform
 
 	var is_marble := int(round(_frames[a + 5])) == 1
+	var use_proxy := not _rig_ready
 	if _capsule != null:
-		_capsule.visible = not is_marble
+		_capsule.visible = not is_marble and use_proxy
 	if _nose != null:
-		_nose.visible = not is_marble
+		_nose.visible = not is_marble and use_proxy
 	if _sphere != null:
 		_sphere.visible = is_marble
 
+	_apply_rig(cursor, xform, is_marble)
 	_apply_vfx(a, xform)
 	_spawn_due_vfx_events(i)
 	_spawn_due_impacts(i)
@@ -602,13 +652,16 @@ func _ensure_ghost() -> void:
 
 	if _ghost != null and is_instance_valid(_ghost) and _ghost.get_parent() == parent:
 		_ghost.visible = true
+		_ensure_rig_visual(player)
 		return
 
 	if _ghost != null and is_instance_valid(_ghost):
+		_free_rig_visual()
 		_ghost.queue_free()
 
 	_ghost = _build_ghost()
 	parent.add_child(_ghost)
+	_ensure_rig_visual(player)
 
 
 func _ensure_vfx_root() -> void:
@@ -770,6 +823,7 @@ func _hide_ghost() -> void:
 		_ghost.visible = false
 		if _trail_mesh != null:
 			_trail_mesh.clear_surfaces()
+	_free_rig_visual()
 	_hide_vfx()
 
 
@@ -784,6 +838,231 @@ func _hide_vfx() -> void:
 		if is_instance_valid(node):
 			node.queue_free()
 	_live_impacts.clear()
+
+
+# --------------------------------------------------------------------------
+# Skeleton ghost
+# --------------------------------------------------------------------------
+
+## The game's own RigAfterimageVFX already points at the body mesh and the
+## marble head, so it doubles as the rig definition. Without it the ghost stays
+## a capsule, which is also the fallback if the rig changes later.
+func _find_rig(player: Node) -> bool:
+	for node in player.find_children("*", "", true, false):
+		if not ("ghost_count" in node) or not ("source" in node):
+			continue
+
+		var source = node.get("source")
+		if not (source is MeshInstance3D):
+			continue
+		var body := source as MeshInstance3D
+		if body.mesh == null or body.skin == null:
+			continue
+
+		var skeleton := body.get_node_or_null(body.skeleton) as Skeleton3D
+		if skeleton == null or skeleton.get_bone_count() == 0:
+			continue
+
+		var head = node.get("head")
+		var head_mesh: MeshInstance3D = head if head is MeshInstance3D else null
+		if head_mesh != null and head_mesh.mesh == null:
+			head_mesh = null
+
+		_rig_skeleton_src = skeleton
+		_rig_head_src = head_mesh
+		_rig_body_path = str(player.get_path_to(body))
+		_rig_head_path = str(player.get_path_to(head_mesh)) if head_mesh != null else ""
+		_rig_bones = PackedStringArray()
+		for bone in skeleton.get_bone_count():
+			_rig_bones.append(skeleton.get_bone_name(bone))
+		_rig_stride = RIG_BASE_FLOATS + RIG_XFORM_FLOATS * _rig_bones.size()
+		return true
+	return false
+
+
+func _append_rig_sample(tick: int, body: Node3D) -> void:
+	if not is_instance_valid(_rig_skeleton_src):
+		_rig_skeleton_src = null
+		return
+
+	var skeleton_xform := _rig_skeleton_src.global_transform
+	var sample := PackedFloat32Array()
+	# The ghost body only stores position and yaw, so the rig offset is kept in
+	# body space. That removes the body's slope tilt while keeping its squash.
+	sample.append_array(_xform_floats(body.global_transform.affine_inverse() * skeleton_xform))
+
+	var head_xform := Transform3D.IDENTITY
+	if _rig_head_src != null and is_instance_valid(_rig_head_src):
+		head_xform = skeleton_xform.affine_inverse() * _rig_head_src.global_transform
+	sample.append_array(_xform_floats(head_xform))
+
+	for bone in _rig_bones.size():
+		sample.append_array(_xform_floats(_rig_skeleton_src.get_bone_global_pose(bone)))
+
+	_rig_samples.append_array(sample)
+	_rig_ticks.append(tick)
+
+
+func _xform_floats(xform: Transform3D) -> PackedFloat32Array:
+	var data := PackedFloat32Array()
+	data.resize(RIG_XFORM_FLOATS)
+	data[0] = xform.basis.x.x
+	data[1] = xform.basis.x.y
+	data[2] = xform.basis.x.z
+	data[3] = xform.basis.y.x
+	data[4] = xform.basis.y.y
+	data[5] = xform.basis.y.z
+	data[6] = xform.basis.z.x
+	data[7] = xform.basis.z.y
+	data[8] = xform.basis.z.z
+	data[9] = xform.origin.x
+	data[10] = xform.origin.y
+	data[11] = xform.origin.z
+	return data
+
+
+func _read_xform(data: PackedFloat32Array, offset: int) -> Transform3D:
+	return Transform3D(
+		Basis(
+			Vector3(data[offset], data[offset + 1], data[offset + 2]),
+			Vector3(data[offset + 3], data[offset + 4], data[offset + 5]),
+			Vector3(data[offset + 6], data[offset + 7], data[offset + 8])
+		),
+		Vector3(data[offset + 9], data[offset + 10], data[offset + 11])
+	)
+
+
+func _ensure_rig_visual(player: Node) -> void:
+	if _rig_ready or _rig_failed or _rig_bones.is_empty() or _rig_samples.is_empty():
+		return
+	if _ghost == null or not is_instance_valid(_ghost):
+		return
+
+	var body_src := player.get_node_or_null(NodePath(_rig_body_path)) as MeshInstance3D
+	if body_src == null or body_src.mesh == null or body_src.skin == null:
+		_rig_failed = true
+		_note("ghost rig unavailable (body mesh changed); using capsule proxy")
+		return
+
+	var skeleton_src := body_src.get_node_or_null(body_src.skeleton) as Skeleton3D
+	if skeleton_src == null or skeleton_src.get_bone_count() != _rig_bones.size():
+		_rig_failed = true
+		_note("ghost rig unavailable (skeleton changed); using capsule proxy")
+		return
+	for bone in _rig_bones.size():
+		if skeleton_src.get_bone_name(bone) != _rig_bones[bone]:
+			_rig_failed = true
+			_note("ghost rig unavailable (bone layout changed); using capsule proxy")
+			return
+
+	_rig_skeleton = Skeleton3D.new()
+	_rig_skeleton.name = "TASGhostRig"
+	_rig_skeleton.top_level = true
+	_rig_skeleton.visible = false
+	for bone in _rig_bones.size():
+		_rig_skeleton.add_bone(_rig_bones[bone])
+		_rig_skeleton.set_bone_rest(bone, Transform3D.IDENTITY)
+
+	var material := _ghost_material()
+	var body := MeshInstance3D.new()
+	body.name = "TASGhostBody"
+	body.mesh = body_src.mesh
+	body.skin = body_src.skin
+	body.layers = body_src.layers
+	body.material_override = material
+	body.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+	body.gi_mode = GeometryInstance3D.GI_MODE_DISABLED
+	_rig_skeleton.add_child(body)
+	body.skeleton = body.get_path_to(_rig_skeleton)
+
+	if _rig_head_path != "":
+		var head_src := player.get_node_or_null(NodePath(_rig_head_path)) as MeshInstance3D
+		if head_src != null and head_src.mesh != null:
+			_rig_head = MeshInstance3D.new()
+			_rig_head.name = "TASGhostHead"
+			_rig_head.mesh = head_src.mesh
+			_rig_head.material_override = material
+			_rig_head.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+			_rig_head.gi_mode = GeometryInstance3D.GI_MODE_DISABLED
+			_rig_head.top_level = true
+			_ghost.add_child(_rig_head)
+
+	_ghost.add_child(_rig_skeleton)
+	_rig_ready = true
+	print("SNAPTIC-TAS ghost: skinned ghost ready (%d bones, %d verts)" % [
+		_rig_bones.size(), body.mesh.get_faces().size()
+	])
+
+
+func _free_rig_visual() -> void:
+	if _rig_skeleton != null and is_instance_valid(_rig_skeleton):
+		_rig_skeleton.queue_free()
+	if _rig_head != null and is_instance_valid(_rig_head):
+		_rig_head.queue_free()
+	_rig_skeleton = null
+	_rig_head = null
+	_rig_ready = false
+	_rig_failed = false
+
+
+func _apply_rig(cursor: float, ghost_xform: Transform3D, is_marble: bool) -> void:
+	if not _rig_ready or _rig_skeleton == null or not is_instance_valid(_rig_skeleton):
+		return
+
+	_rig_skeleton.visible = not is_marble
+	if _rig_head != null:
+		_rig_head.visible = not is_marble
+	if is_marble:
+		return
+
+	var k := _rig_sample_index(cursor)
+	if k < 0:
+		return
+	var next := mini(k + 1, _rig_ticks.size() - 1)
+	var t := 0.0
+	if next > k:
+		var span := float(_rig_ticks[next] - _rig_ticks[k])
+		if span > 0.0:
+			t = clampf((cursor - float(_rig_ticks[k])) / span, 0.0, 1.0)
+
+	var offset := k * _rig_stride
+	var offset_next := next * _rig_stride
+	var rig_xform := ghost_xform * _read_xform(_rig_samples, offset) \
+		.interpolate_with(_read_xform(_rig_samples, offset_next), t)
+	_rig_skeleton.global_transform = rig_xform
+
+	for bone in _rig_bones.size():
+		var bone_offset := offset + RIG_BASE_FLOATS + bone * RIG_XFORM_FLOATS
+		var bone_offset_next := offset_next + RIG_BASE_FLOATS + bone * RIG_XFORM_FLOATS
+		_rig_skeleton.set_bone_pose(bone, _read_xform(_rig_samples, bone_offset) \
+			.interpolate_with(_read_xform(_rig_samples, bone_offset_next), t))
+
+	if _rig_head != null:
+		var head_offset := offset + RIG_XFORM_FLOATS
+		var head_offset_next := offset_next + RIG_XFORM_FLOATS
+		_rig_head.global_transform = rig_xform * _read_xform(_rig_samples, head_offset) \
+			.interpolate_with(_read_xform(_rig_samples, head_offset_next), t)
+
+
+## Largest sample index whose tick is at or before the cursor.
+func _rig_sample_index(cursor: float) -> int:
+	var count := _rig_ticks.size()
+	if count == 0:
+		return -1
+	if cursor <= float(_rig_ticks[0]):
+		return 0
+	if cursor >= float(_rig_ticks[count - 1]):
+		return count - 1
+
+	var low := 0
+	var high := count - 1
+	while low < high:
+		var mid := (low + high + 1) / 2
+		if float(_rig_ticks[mid]) <= cursor:
+			low = mid
+		else:
+			high = mid - 1
+	return low
 
 
 # --------------------------------------------------------------------------
@@ -809,8 +1088,19 @@ func _save_ghost(path: String) -> void:
 		"states": _states,
 		"impact_ticks": _impact_ticks,
 		"impact_positions": _impact_positions,
+		"rig_bones": _rig_bones,
+		"rig_body_path": _rig_body_path,
+		"rig_head_path": _rig_head_path,
+		"rig_ticks": _rig_ticks,
+		"rig_samples": _rig_samples,
 	})
 	file.close()
+
+	var check := FileAccess.open(path, FileAccess.READ)
+	if check != null:
+		var megabytes := float(check.get_length()) / 1048576.0
+		check.close()
+		print("SNAPTIC-TAS ghost: saved %.1f MB" % megabytes)
 
 
 func _load_ghost(path: String) -> void:
@@ -868,6 +1158,36 @@ func _load_ghost(path: String) -> void:
 	if ticks.size() != positions.size():
 		return
 
+	var rig_bones = entry.get("rig_bones", null)
+	var rig_body_path = entry.get("rig_body_path", null)
+	var rig_head_path = entry.get("rig_head_path", null)
+	var rig_tick_list = entry.get("rig_ticks", null)
+	var rig_samples = entry.get("rig_samples", null)
+	if not (rig_bones is PackedStringArray):
+		return
+	if not (rig_body_path is String) or not (rig_head_path is String):
+		return
+	if not (rig_tick_list is PackedInt32Array) or not (rig_samples is PackedFloat32Array):
+		return
+
+	var bones: PackedStringArray = rig_bones
+	var rig_stride := RIG_BASE_FLOATS + RIG_XFORM_FLOATS * bones.size()
+	if bones.is_empty():
+		if not (rig_tick_list as PackedInt32Array).is_empty():
+			return
+		if not (rig_samples as PackedFloat32Array).is_empty():
+			return
+	else:
+		if rig_body_path == "":
+			return
+		if (rig_samples as PackedFloat32Array).size() % rig_stride != 0:
+			return
+		if (rig_tick_list as PackedInt32Array).size() \
+				!= (rig_samples as PackedFloat32Array).size() / rig_stride:
+			return
+		if (rig_tick_list as PackedInt32Array)[-1] >= packed.size() / stride:
+			return
+
 	_frames = packed
 	_states = states
 	_stride = stride
@@ -877,6 +1197,15 @@ func _load_ghost(path: String) -> void:
 	_vfx_event_index = event_index
 	_impact_ticks = ticks
 	_impact_positions = positions
+	_rig_bones = bones
+	_rig_body_path = rig_body_path
+	_rig_head_path = rig_head_path
+	_rig_ticks = rig_tick_list
+	_rig_samples = rig_samples
+	_rig_stride = rig_stride
+	_rig_skeleton_src = null
+	_rig_head_src = null
+	_free_rig_visual()
 	_vfx_event_next = 0
 	_impact_next = 0
 	_cursor = 0.0
@@ -896,6 +1225,14 @@ func _unload() -> void:
 	_impact_ticks = PackedInt32Array()
 	_impact_positions = PackedVector3Array()
 	_impact_next = 0
+	_rig_bones = PackedStringArray()
+	_rig_body_path = ""
+	_rig_head_path = ""
+	_rig_ticks = PackedInt32Array()
+	_rig_samples = PackedFloat32Array()
+	_rig_stride = 0
+	_rig_skeleton_src = null
+	_rig_head_src = null
 	_cursor = 0.0
 	_note("ghost unloaded")
 
