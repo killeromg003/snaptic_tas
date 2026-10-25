@@ -284,8 +284,7 @@ func hash(snapshot: Dictionary) -> int:
 		"format": int(snapshot.get("format", FORMAT_VERSION)),
 		"level": int(snapshot.get("level", -1)),
 		"sim": active_only(sim),      # ← was: sim
-		"camera_rotation": {
-		},
+		"camera_rotation": rotation_controllers,
 	}
 	var context := HashingContext.new()
 	context.start(HashingContext.HASH_SHA256)

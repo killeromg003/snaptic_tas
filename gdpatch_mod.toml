@@ -2,9 +2,9 @@ id = "snaptic_tas"
 
 [meta]
 name = "SNAPTIC-TAS"
-version = "0.2.0"
+version = "0.3.0"
 authors = ["killeromg003"]
-description = "TAS tool: pause, frame-step, slow-mo, snapshots, freelook while paused."
+description = "TAS tool: pause, frame-step, slow-mo, HUD, and a ghost recorder (record/playback of the player's path)."
 
 [config.debug]
 [config.debug.autoload_level]

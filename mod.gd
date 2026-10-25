@@ -8,7 +8,7 @@ extends Node
 ## mismatch it shows an error HUD and leaves the game running unmodified (the
 ## Lua patches are anchored and fail closed, but they may still be present).
 
-const TOOL_VERSION: String = "0.2.0"
+const TOOL_VERSION: String = "0.3.0"
 const REQUIRED_ENGINE: String = "4.7.1"
 const REQUIRED_GAME: String = "0.91"
 const REQUIRED_TICK_RATE: int = 60
@@ -101,6 +101,19 @@ func _boot() -> void:
 		return
 	_runtime.name = "TASRuntime"
 	add_child(_runtime)
+
+	var ghost_script = load("res://gdpatch/mods/snaptic_tas/tas_ghost.gd")
+	if ghost_script == null:
+		_log("warning: tas_ghost.gd failed to load; ghost recorder disabled")
+	else:
+		var ghost = ghost_script.new()
+		if ghost == null:
+			_log("warning: tas_ghost.gd could not be instantiated")
+		else:
+			ghost.name = "TASGhost"
+			add_child(ghost)
+			_log("ghost recorder ready (F8 record, F9 play, F10 rewind)")
+
 	_log("enabled: SNAPTIC %s / Godot %s / %d Hz" % [
 		game_version, found_engine, Engine.physics_ticks_per_second
 	])
